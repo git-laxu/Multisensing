@@ -1,0 +1,1571 @@
+# -*- coding: utf-8 -*-
+"""
+统一后端服务入口
+整合 CSI 采集和视频采集两个服务，提供统一管理接口
+"""
+
+from contextlib import asynccontextmanager
+from pathlib import Path
+import os
+import tempfile
+import zipfile
+import shutil
+from typing import Optional, Any, Dict
+
+
+import sys
+import uvicorn
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# =============================================================================
+# 路径处理
+# =============================================================================
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+# =============================================================================
+# 导入子服务
+# 注意：要求 csi_service/main.py 和 cam_service/main.py 内部都已经改成相对导入
+# =============================================================================
+from csi_service.main import CSIService as CSIHandler
+from csi_service.data_manager import CSIDataManager
+from cam_service.main import CamService as CamHandler
+from cam_service.data_manager import CameraDataManager
+from temp_service.main import TempService as TempHandler
+from temp_service.data_manager import TempDataManager
+from rad_service.main import RadService as RadHandler
+from rad_service.data_manager import RadDataManager
+from light_service.main import LightService as LightHandler
+from light_service.data_manager import LightDataManager
+
+# =============================================================================
+# 全局服务实例
+# =============================================================================
+csi_handler: Optional[CSIHandler] = None
+csi_data_manager: Optional[CSIDataManager] = None
+cam_handler: Optional[CamHandler] = None
+camera_data_manager: Optional[CameraDataManager] = None
+temp_handler: Optional[TempHandler] = None
+temp_data_manager: Optional[TempDataManager] = None
+rad_handler: Optional[RadHandler] = None
+rad_data_manager: Optional[RadDataManager] = None
+light_handler: Optional[LightHandler] = None
+light_data_manager: Optional[LightDataManager] = None
+
+
+# =============================================================================
+# 请求模型
+# =============================================================================
+class CameraStartRequest(BaseModel):
+    camera_index: int = Field(default=0, description="摄像头索引")
+    frame_rate: int = Field(default=30, description="采集帧率")
+    display_mode: str = Field(default="right", description="显示模式：right / left / stereo")
+    project_name: str = Field(default="default_project", description="当前项目名称")
+    save_options: Dict[str, Any] = Field(default_factory=dict, description="保存选项")
+    # save_options: Dict[str, Any] = {}
+
+class CSIStartRequest(BaseModel):
+    project_name: str = Field(default="default_project", description="当前项目名称")
+    save_options: Dict[str, Any] = Field(default_factory=dict, description="保存选项")
+
+class TempStartRequest(BaseModel):
+    port: str = Field(..., description="温湿度传感器串口号，例如 COM5")
+    baudrate: int = Field(default=9600, description="波特率")
+    project_name: str = Field(default="default_project", description="当前项目名称")
+    save_options: Dict[str, Any] = Field(default_factory=dict, description="保存选项")
+
+class RadStartRequest(BaseModel):
+    port: str = Field(..., description="热辐射传感器串口号，例如 COM6")
+    baudrate: int = Field(default=9600, description="波特率")
+    project_name: str = Field(default="default_project", description="当前项目名称")
+    save_options: Dict[str, Any] = Field(default_factory=dict, description="保存选项")
+
+class LightStartRequest(BaseModel):
+    port: str = Field(..., description="照明传感器串口号，例如 COM7")
+    baudrate: int = Field(default=9600, description="波特率")
+    project_name: str = Field(default="default_project", description="当前项目名称")
+    save_options: Dict[str, Any] = Field(default_factory=dict, description="保存选项")
+
+# =============================================================================
+# 工具函数
+# =============================================================================
+def safe_get_status(handler: Any, default_name: str) -> Dict[str, Any]:
+    if handler is None:
+        return {
+            "service": default_name,
+            "initialized": False,
+            "running": False
+        }
+
+    try:
+        status = handler.get_status()
+        if isinstance(status, dict):
+            status.setdefault("service", default_name)
+            status.setdefault("initialized", True)
+            status.setdefault("running", bool(getattr(handler, "is_running", False)))
+            return status
+
+        return {
+            "service": default_name,
+            "initialized": True,
+            "running": bool(getattr(handler, "is_running", False)),
+            "raw_status": str(status)
+        }
+    except Exception as e:
+        return {
+            "service": default_name,
+            "initialized": True,
+            "running": bool(getattr(handler, "is_running", False)),
+            "error": f"状态获取失败: {str(e)}"
+        }
+
+
+async def safe_stop_handler(handler: Any, name: str):
+    if handler is None:
+        return
+    try:
+        if getattr(handler, "is_running", False):
+            await handler.stop()
+            print(f"[MAIN] {name} 已停止")
+    except Exception as e:
+        print(f"[MAIN] {name} 停止失败: {e}")
+
+# 新增一个工具函数：把多个目录打进一个 zip
+def build_combined_session_zip(
+    project_name: str,
+    session_id: str,
+    temp_session_id: Optional[str] = None,
+    rad_session_id: Optional[str] = None,
+) -> Path:
+    """
+    将热环境数据中的温湿度 session 和热辐射 session 合并打包为一个 zip
+    """
+
+    if temp_data_manager is None or rad_data_manager is None:
+        raise RuntimeError("热环境数据管理器未初始化")
+
+    temp_session_path = None
+    rad_session_path = None
+
+    # 如果没有显式传入，就默认使用同名 session_id
+    if temp_session_id:
+        temp_session_path = temp_data_manager._session_path(project_name, temp_session_id)
+    else:
+        candidate = temp_data_manager._session_path(project_name, session_id)
+        if candidate.exists():
+            temp_session_path = candidate
+
+    if rad_session_id:
+        rad_session_path = rad_data_manager._session_path(project_name, rad_session_id)
+    else:
+        candidate = rad_data_manager._session_path(project_name, session_id)
+        if candidate.exists():
+            rad_session_path = candidate
+
+    if temp_session_path is None and rad_session_path is None:
+        raise FileNotFoundError(f"未找到热环境 session：{project_name}/{session_id}")
+
+    fd, tmp_zip = tempfile.mkstemp(
+        prefix=f"{project_name}_{session_id}_thermal_env_",
+        suffix=".zip"
+    )
+    os.close(fd)
+    zip_path = Path(tmp_zip)
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if temp_session_path and temp_session_path.exists():
+            for p in temp_session_path.rglob("*"):
+                if p.is_file():
+                    arcname = Path("temperature_humidity") / temp_session_path.name / p.relative_to(temp_session_path)
+                    zf.write(p, arcname)
+
+        if rad_session_path and rad_session_path.exists():
+            for p in rad_session_path.rglob("*"):
+                if p.is_file():
+                    arcname = Path("thermal_radiation") / rad_session_path.name / p.relative_to(rad_session_path)
+                    zf.write(p, arcname)
+
+    return zip_path
+
+# 新增一个“热环境项目级打包函数”
+def build_combined_project_zip(project_name: str) -> Path:
+    """
+    将某个项目下所有热环境数据（温湿度 + 热辐射）整体打包为一个 zip
+    """
+    if temp_data_manager is None or rad_data_manager is None:
+        raise RuntimeError("热环境数据管理器未初始化")
+
+    temp_project_path = temp_data_manager._project_path(project_name)
+    rad_project_path = rad_data_manager._project_path(project_name)
+
+    if not temp_project_path.exists() and not rad_project_path.exists():
+        raise FileNotFoundError(f"未找到热环境项目：{project_name}")
+
+    fd, tmp_zip = tempfile.mkstemp(
+        prefix=f"{project_name}_thermal_env_all_",
+        suffix=".zip"
+    )
+    os.close(fd)
+    zip_path = Path(tmp_zip)
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if temp_project_path.exists():
+            for p in temp_project_path.rglob("*"):
+                if p.is_file():
+                    arcname = Path("temperature_humidity_project") / project_name / p.relative_to(temp_project_path)
+                    zf.write(p, arcname)
+
+        if rad_project_path.exists():
+            for p in rad_project_path.rglob("*"):
+                if p.is_file():
+                    arcname = Path("thermal_radiation_project") / project_name / p.relative_to(rad_project_path)
+                    zf.write(p, arcname)
+
+    return zip_path
+
+# =============================================================================
+# 生命周期管理
+# =============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global csi_handler, csi_data_manager
+    global cam_handler, camera_data_manager
+    global temp_handler, temp_data_manager
+    global rad_handler, rad_data_manager
+    global light_handler, light_data_manager    
+
+    try:
+        csi_handler = CSIHandler()
+        csi_data_manager = CSIDataManager(BASE_DIR / "csi_service" / "csi_data")
+        cam_handler = CamHandler()
+        camera_data_manager = CameraDataManager(BASE_DIR / "cam_service" / "cam_data")
+        temp_handler = TempHandler()
+        temp_data_manager = TempDataManager(BASE_DIR / "temp_service" / "temp_data")
+        rad_handler = RadHandler()
+        rad_data_manager = RadDataManager(BASE_DIR / "rad_service" / "rad_data")
+        light_handler = LightHandler()
+        light_data_manager = LightDataManager(BASE_DIR / "light_service" / "light_data")
+
+        print("[MAIN] CSI 服务初始化完成")
+        print("[MAIN] Camera 服务初始化完成")
+        print("[MAIN] CSI 数据管理器初始化完成")
+        print("[MAIN] Camera 后端服务启动完成")
+        print("[MAIN] Temp 服务初始化完成")
+        print("[MAIN] Temp 数据管理器初始化完成")
+        print("[MAIN] Rad 服务初始化完成")
+        print("[MAIN] Rad 数据管理器初始化完成")
+        print("[MAIN] Light 服务初始化完成")        
+        print("[MAIN] Light 数据管理器初始化完成")
+        print("[MAIN] 后端服务启动完成")
+    except Exception as e:
+        print(f"[MAIN] 服务初始化失败: {e}")
+        raise
+
+    yield
+
+    await safe_stop_handler(csi_handler, "CSI 服务")
+    await safe_stop_handler(cam_handler, "Camera 服务")
+    await safe_stop_handler(temp_handler, "Temp 服务")
+    await safe_stop_handler(rad_handler, "Rad 服务")
+    await safe_stop_handler(light_handler, "Light 服务")
+    print("[MAIN] 后端服务关闭完成")
+
+
+# =============================================================================
+# FastAPI 应用
+# =============================================================================
+app = FastAPI(
+    title="多传感器数据采集服务",
+    version="1.1.0",
+    description="整合 CSI 采集和视频采集的统一后端服务",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =============================================================================
+# 根路径与健康检查
+# =============================================================================
+@app.get("/")
+async def root():
+    return {
+        "service": "多传感器数据采集服务",
+        "version": "1.1.0",
+        "api_base": "http://127.0.0.1:8000",
+        "endpoints": {
+            "health": "/health",
+            "status": "/api/status",
+            "csi": {
+                "start": "/api/csi/start",
+                "stop": "/api/csi/stop",
+                "status": "/api/csi/status",
+                "websocket": "/api/csi/ws"
+            },
+            "camera": {
+                "start": "/api/camera/start",
+                "stop": "/api/camera/stop",
+                "status": "/api/camera/status",
+                "websocket": "/api/camera/ws"
+            },
+            "temp": {
+                "start": "/api/temp/start",
+                "stop": "/api/temp/stop",
+                "status": "/api/temp/status",
+                "websocket": "/api/temp/ws"
+            },
+            "rad": {
+                "start": "/api/rad/start",
+                "stop": "/api/rad/stop",
+                "status": "/api/rad/status",
+                "websocket": "/api/rad/ws"
+            },
+            "light": {
+                "start": "/api/light/start",
+                "stop": "/api/light/stop",
+                "status": "/api/light/status",
+                "websocket": "/api/light/ws"
+            }
+        }
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "message": "backend is running"}
+
+
+# =============================================================================
+# 平台整体状态
+# =============================================================================
+@app.get("/api/status")
+async def get_overall_status():
+    return {
+        "success": True,
+        "data": {
+            "csi": safe_get_status(csi_handler, "csi"),
+            "camera": safe_get_status(cam_handler, "camera"),
+            "temp": safe_get_status(temp_handler, "temp"),
+            "rad": safe_get_status(rad_handler, "rad"),
+            "light": safe_get_status(light_handler, "light"),
+        }
+    }
+
+# =============================================================================
+# Camera 数据管理接口
+# =============================================================================
+@app.get("/api/projects")
+async def get_projects():
+    if not camera_data_manager:
+        raise HTTPException(status_code=500, detail="Camera 数据管理器未初始化")
+
+    try:
+        projects = camera_data_manager.list_projects()
+        return {
+            "success": True,
+            "projects": projects
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取项目列表失败: {str(e)}")
+
+
+@app.get("/api/projects/{project_name}/sessions")
+async def get_project_sessions(project_name: str):
+    if not camera_data_manager:
+        raise HTTPException(status_code=500, detail="Camera 数据管理器未初始化")
+
+    try:
+        sessions = camera_data_manager.list_sessions(project_name)
+        return {
+            "success": True,
+            "project_name": project_name,
+            "sessions": sessions
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取项目 session 列表失败: {str(e)}")
+
+
+@app.get("/api/projects/{project_name}/sessions/{session_id}")
+async def get_session_info(project_name: str, session_id: str):
+    if not camera_data_manager:
+        raise HTTPException(status_code=500, detail="Camera 数据管理器未初始化")
+
+    try:
+        session_info = camera_data_manager.get_session_info(project_name, session_id)
+        return {
+            "success": True,
+            "project_name": project_name,
+            "session": session_info
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取 session 信息失败: {str(e)}")
+
+
+@app.delete("/api/projects/{project_name}/sessions/{session_id}")
+async def delete_session(project_name: str, session_id: str):
+    if not camera_data_manager:
+        raise HTTPException(status_code=500, detail="Camera 数据管理器未初始化")
+
+    try:
+        result = camera_data_manager.delete_session(project_name, session_id)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除 session 失败: {str(e)}")
+
+
+@app.delete("/api/projects/{project_name}")
+async def delete_project(project_name: str):
+    if not camera_data_manager:
+        raise HTTPException(status_code=500, detail="Camera 数据管理器未初始化")
+
+    try:
+        result = camera_data_manager.delete_project(project_name)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除项目失败: {str(e)}")
+
+
+@app.get("/api/projects/{project_name}/sessions/{session_id}/download")
+async def download_session(project_name: str, session_id: str):
+    if not camera_data_manager:
+        raise HTTPException(status_code=500, detail="Camera 数据管理器未初始化")
+
+    try:
+        zip_path = camera_data_manager.build_session_zip(project_name, session_id)
+
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_{session_id}.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载 session 失败: {str(e)}")
+
+
+@app.get("/api/projects/{project_name}/download")
+async def download_project(project_name: str):
+    if not camera_data_manager:
+        raise HTTPException(status_code=500, detail="Camera 数据管理器未初始化")
+
+    try:
+        zip_path = camera_data_manager.build_project_zip(project_name)
+
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载项目失败: {str(e)}")
+
+
+# =============================================================================
+# CSI 接口
+# =============================================================================
+@app.post("/api/csi/start")
+async def start_csi(payload: Optional[CSIStartRequest] = None):
+    if not csi_handler:
+        raise HTTPException(status_code=500, detail="CSI 服务未初始化")
+
+    try:
+        if getattr(csi_handler, "is_running", False):
+            return {
+                "success": True,
+                "message": "CSI 服务已经在运行",
+                "data": safe_get_status(csi_handler, "csi")
+            }
+
+        if payload is None:
+            payload = CSIStartRequest()
+
+        result = await csi_handler.start({
+            "project_name": payload.project_name,
+            "save_options": payload.save_options,
+        })
+
+        return {
+            "success": True,
+            "message": "CSI 服务启动成功",
+            "data": result if result is not None else safe_get_status(csi_handler, "csi")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CSI 服务启动失败: {str(e)}")
+
+
+@app.post("/api/csi/stop")
+async def stop_csi():
+    if not csi_handler:
+        raise HTTPException(status_code=500, detail="CSI 服务未初始化")
+
+    try:
+        if not getattr(csi_handler, "is_running", False):
+            return {
+                "success": True,
+                "message": "CSI 服务当前未运行",
+                "data": safe_get_status(csi_handler, "csi")
+            }
+
+        result = await csi_handler.stop()
+
+        return {
+            "success": True,
+            "message": "CSI 服务已停止",
+            "data": result if result is not None else safe_get_status(csi_handler, "csi")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CSI 服务停止失败: {str(e)}")
+
+
+@app.get("/api/csi/status")
+async def get_csi_status():
+    if not csi_handler:
+        raise HTTPException(status_code=500, detail="CSI 服务未初始化")
+
+    return {
+        "success": True,
+        "data": safe_get_status(csi_handler, "csi")
+    }
+
+# =============================================================================
+# CSI 数据管理接口
+# =============================================================================
+@app.get("/api/csi/projects")
+async def get_csi_projects():
+    if not csi_data_manager:
+        raise HTTPException(status_code=500, detail="CSI 数据管理器未初始化")
+
+    try:
+        projects = csi_data_manager.list_projects()
+        return {
+            "success": True,
+            "projects": projects
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取 CSI 项目列表失败: {str(e)}")
+
+
+@app.get("/api/csi/projects/{project_name}/sessions")
+async def get_csi_project_sessions(project_name: str):
+    if not csi_data_manager:
+        raise HTTPException(status_code=500, detail="CSI 数据管理器未初始化")
+
+    try:
+        sessions = csi_data_manager.list_sessions(project_name)
+        return {
+            "success": True,
+            "project_name": project_name,
+            "sessions": sessions
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取 CSI session 列表失败: {str(e)}")
+
+
+@app.get("/api/csi/projects/{project_name}/sessions/{session_id}")
+async def get_csi_session_info(project_name: str, session_id: str):
+    if not csi_data_manager:
+        raise HTTPException(status_code=500, detail="CSI 数据管理器未初始化")
+
+    try:
+        session_info = csi_data_manager.get_session_info(project_name, session_id)
+        return {
+            "success": True,
+            "project_name": project_name,
+            "session": session_info
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取 CSI session 信息失败: {str(e)}")
+
+
+@app.delete("/api/csi/projects/{project_name}/sessions/{session_id}")
+async def delete_csi_session(project_name: str, session_id: str):
+    if not csi_data_manager:
+        raise HTTPException(status_code=500, detail="CSI 数据管理器未初始化")
+
+    try:
+        result = csi_data_manager.delete_session(project_name, session_id)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除 CSI session 失败: {str(e)}")
+
+
+@app.delete("/api/csi/projects/{project_name}")
+async def delete_csi_project(project_name: str):
+    if not csi_data_manager:
+        raise HTTPException(status_code=500, detail="CSI 数据管理器未初始化")
+
+    try:
+        result = csi_data_manager.delete_project(project_name)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除 CSI 项目失败: {str(e)}")
+
+
+@app.get("/api/csi/projects/{project_name}/sessions/{session_id}/download")
+async def download_csi_session(project_name: str, session_id: str):
+    if not csi_data_manager:
+        raise HTTPException(status_code=500, detail="CSI 数据管理器未初始化")
+
+    try:
+        zip_path = csi_data_manager.build_session_zip(project_name, session_id)
+
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_{session_id}_csi.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载 CSI session 失败: {str(e)}")
+
+
+@app.get("/api/csi/projects/{project_name}/download")
+async def download_csi_project(project_name: str):
+    if not csi_data_manager:
+        raise HTTPException(status_code=500, detail="CSI 数据管理器未初始化")
+
+    try:
+        zip_path = csi_data_manager.build_project_zip(project_name)
+
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_csi.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载 CSI 项目失败: {str(e)}")
+
+
+@app.websocket("/api/csi/ws")
+async def csi_websocket(websocket: WebSocket):
+    if not csi_handler:
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept()
+
+    try:
+        await csi_handler.connect_websocket(websocket)
+
+        while True:
+            data = await websocket.receive_text()
+
+            if data == "ping":
+                await websocket.send_text("pong")
+            elif data == "status":
+                await websocket.send_json({
+                    "success": True,
+                    "data": safe_get_status(csi_handler, "csi")
+                })
+            else:
+                await websocket.send_json({
+                    "success": False,
+                    "message": f"未知指令: {data}"
+                })
+
+    except WebSocketDisconnect:
+        print("[CSI] WebSocket 客户端主动断开")
+    except Exception as e:
+        print(f"[CSI] WebSocket 异常断开: {e}")
+    finally:
+        try:
+            await csi_handler.disconnect_websocket(websocket)
+        except Exception:
+            pass
+
+# =============================================================================
+# Temp 接口
+# =============================================================================
+@app.post("/api/temp/start")
+async def start_temp(payload: TempStartRequest):
+    if not temp_handler:
+        raise HTTPException(status_code=500, detail="温湿度服务未初始化")
+
+    try:
+        if getattr(temp_handler, "is_running", False):
+            return {
+                "success": True,
+                "message": "温湿度服务已经在运行",
+                "data": safe_get_status(temp_handler, "temp")
+            }
+
+        result = await temp_handler.start({
+            "port": payload.port,
+            "baudrate": payload.baudrate,
+            "project_name": payload.project_name,
+            "save_options": payload.save_options
+        })
+
+        return {
+            "success": True,
+            "message": "温湿度服务启动成功",
+            "data": result if result is not None else safe_get_status(temp_handler, "temp")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"温湿度服务启动失败: {str(e)}")
+
+
+@app.post("/api/temp/stop")
+async def stop_temp():
+    if not temp_handler:
+        raise HTTPException(status_code=500, detail="温湿度服务未初始化")
+
+    try:
+        if not getattr(temp_handler, "is_running", False):
+            return {
+                "success": True,
+                "message": "温湿度服务当前未运行",
+                "data": safe_get_status(temp_handler, "temp")
+            }
+
+        result = await temp_handler.stop()
+
+        return {
+            "success": True,
+            "message": "温湿度服务已停止",
+            "data": result if result is not None else safe_get_status(temp_handler, "temp")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"温湿度服务停止失败: {str(e)}")
+
+
+@app.get("/api/temp/status")
+async def get_temp_status():
+    if not temp_handler:
+        raise HTTPException(status_code=500, detail="温湿度服务未初始化")
+
+    return {
+        "success": True,
+        "data": safe_get_status(temp_handler, "temp")
+    }
+
+
+@app.websocket("/api/temp/ws")
+async def temp_websocket(websocket: WebSocket):
+    if not temp_handler:
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept()
+
+    try:
+        await temp_handler.connect_websocket(websocket)
+
+        while True:
+            data = await websocket.receive_text()
+
+            if data == "ping":
+                await websocket.send_text("pong")
+            elif data == "status":
+                await websocket.send_json({
+                    "success": True,
+                    "data": safe_get_status(temp_handler, "temp")
+                })
+            else:
+                await websocket.send_json({
+                    "success": False,
+                    "message": f"未知指令: {data}"
+                })
+
+    except WebSocketDisconnect:
+        print("[TEMP] WebSocket 客户端主动断开")
+    except Exception as e:
+        print(f"[TEMP] WebSocket 异常断开: {e}")
+    finally:
+        try:
+            await temp_handler.disconnect_websocket(websocket)
+        except Exception:
+            pass
+
+# =============================================================================
+# Temp 数据管理接口
+# =============================================================================
+@app.get("/api/temp/projects")
+async def get_temp_projects():
+    if not temp_data_manager:
+        raise HTTPException(status_code=500, detail="温湿度数据管理器未初始化")
+
+    try:
+        projects = temp_data_manager.list_projects()
+        return {
+            "success": True,
+            "projects": projects
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取温湿度项目列表失败: {str(e)}")
+
+
+@app.get("/api/temp/projects/{project_name}/sessions")
+async def get_temp_project_sessions(project_name: str):
+    if not temp_data_manager:
+        raise HTTPException(status_code=500, detail="温湿度数据管理器未初始化")
+
+    try:
+        sessions = temp_data_manager.list_sessions(project_name)
+        return {
+            "success": True,
+            "project_name": project_name,
+            "sessions": sessions
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取温湿度 session 列表失败: {str(e)}")
+
+
+@app.get("/api/temp/projects/{project_name}/sessions/{session_id}")
+async def get_temp_session_info(project_name: str, session_id: str):
+    if not temp_data_manager:
+        raise HTTPException(status_code=500, detail="温湿度数据管理器未初始化")
+
+    try:
+        session_info = temp_data_manager.get_session_info(project_name, session_id)
+        return {
+            "success": True,
+            "project_name": project_name,
+            "session": session_info
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取温湿度 session 信息失败: {str(e)}")
+
+
+@app.delete("/api/temp/projects/{project_name}/sessions/{session_id}")
+async def delete_temp_session(project_name: str, session_id: str):
+    if not temp_data_manager:
+        raise HTTPException(status_code=500, detail="温湿度数据管理器未初始化")
+
+    try:
+        result = temp_data_manager.delete_session(project_name, session_id)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除温湿度 session 失败: {str(e)}")
+
+
+@app.delete("/api/temp/projects/{project_name}")
+async def delete_temp_project(project_name: str):
+    if not temp_data_manager:
+        raise HTTPException(status_code=500, detail="温湿度数据管理器未初始化")
+
+    try:
+        result = temp_data_manager.delete_project(project_name)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除温湿度项目失败: {str(e)}")
+
+
+@app.get("/api/temp/projects/{project_name}/sessions/{session_id}/download")
+async def download_temp_session(project_name: str, session_id: str):
+    if not temp_data_manager:
+        raise HTTPException(status_code=500, detail="温湿度数据管理器未初始化")
+
+    try:
+        zip_path = temp_data_manager.build_session_zip(project_name, session_id)
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_{session_id}_temp.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载温湿度 session 失败: {str(e)}")
+
+
+@app.get("/api/temp/projects/{project_name}/download")
+async def download_temp_project(project_name: str):
+    if not temp_data_manager:
+        raise HTTPException(status_code=500, detail="温湿度数据管理器未初始化")
+
+    try:
+        zip_path = temp_data_manager.build_project_zip(project_name)
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_temp.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载温湿度项目失败: {str(e)}")
+
+# =============================================================================
+# Rad 接口
+# =============================================================================
+@app.post("/api/rad/start")
+async def start_rad(payload: RadStartRequest):
+    if not rad_handler:
+        raise HTTPException(status_code=500, detail="热辐射服务未初始化")
+
+    try:
+        if getattr(rad_handler, "is_running", False):
+            return {
+                "success": True,
+                "message": "热辐射服务已经在运行",
+                "data": safe_get_status(rad_handler, "rad")
+            }
+
+        result = await rad_handler.start({
+            "port": payload.port,
+            "baudrate": payload.baudrate,
+            "project_name": payload.project_name,
+            "save_options": payload.save_options
+        })
+
+        return {
+            "success": True,
+            "message": "热辐射服务启动成功",
+            "data": result if result is not None else safe_get_status(rad_handler, "rad")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"热辐射服务启动失败: {str(e)}")
+
+
+@app.post("/api/rad/stop")
+async def stop_rad():
+    if not rad_handler:
+        raise HTTPException(status_code=500, detail="热辐射服务未初始化")
+
+    try:
+        if not getattr(rad_handler, "is_running", False):
+            return {
+                "success": True,
+                "message": "热辐射服务当前未运行",
+                "data": safe_get_status(rad_handler, "rad")
+            }
+
+        result = await rad_handler.stop()
+
+        return {
+            "success": True,
+            "message": "热辐射服务已停止",
+            "data": result if result is not None else safe_get_status(rad_handler, "rad")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"热辐射服务停止失败: {str(e)}")
+
+
+@app.get("/api/rad/status")
+async def get_rad_status():
+    if not rad_handler:
+        raise HTTPException(status_code=500, detail="热辐射服务未初始化")
+
+    return {
+        "success": True,
+        "data": safe_get_status(rad_handler, "rad")
+    }
+
+
+@app.websocket("/api/rad/ws")
+async def rad_websocket(websocket: WebSocket):
+    if not rad_handler:
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept()
+
+    try:
+        await rad_handler.connect_websocket(websocket)
+
+        while True:
+            data = await websocket.receive_text()
+
+            if data == "ping":
+                await websocket.send_text("pong")
+            elif data == "status":
+                await websocket.send_json({
+                    "success": True,
+                    "data": safe_get_status(rad_handler, "rad")
+                })
+            else:
+                await websocket.send_json({
+                    "success": False,
+                    "message": f"未知指令: {data}"
+                })
+
+    except WebSocketDisconnect:
+        print("[RAD] WebSocket 客户端主动断开")
+    except Exception as e:
+        print(f"[RAD] WebSocket 异常断开: {e}")
+    finally:
+        try:
+            await rad_handler.disconnect_websocket(websocket)
+        except Exception:
+            pass
+
+# =============================================================================
+# Rad 数据管理接口
+# =============================================================================
+@app.get("/api/rad/projects")
+async def get_rad_projects():
+    if not rad_data_manager:
+        raise HTTPException(status_code=500, detail="热辐射数据管理器未初始化")
+
+    try:
+        projects = rad_data_manager.list_projects()
+        return {
+            "success": True,
+            "projects": projects
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取热辐射项目列表失败: {str(e)}")
+
+
+@app.get("/api/rad/projects/{project_name}/sessions")
+async def get_rad_project_sessions(project_name: str):
+    if not rad_data_manager:
+        raise HTTPException(status_code=500, detail="热辐射数据管理器未初始化")
+
+    try:
+        sessions = rad_data_manager.list_sessions(project_name)
+        return {
+            "success": True,
+            "project_name": project_name,
+            "sessions": sessions
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取热辐射 session 列表失败: {str(e)}")
+
+
+@app.get("/api/rad/projects/{project_name}/sessions/{session_id}")
+async def get_rad_session_info(project_name: str, session_id: str):
+    if not rad_data_manager:
+        raise HTTPException(status_code=500, detail="热辐射数据管理器未初始化")
+
+    try:
+        session_info = rad_data_manager.get_session_info(project_name, session_id)
+        return {
+            "success": True,
+            "project_name": project_name,
+            "session": session_info
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取热辐射 session 信息失败: {str(e)}")
+
+
+@app.delete("/api/rad/projects/{project_name}/sessions/{session_id}")
+async def delete_rad_session(project_name: str, session_id: str):
+    if not rad_data_manager:
+        raise HTTPException(status_code=500, detail="热辐射数据管理器未初始化")
+
+    try:
+        result = rad_data_manager.delete_session(project_name, session_id)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除热辐射 session 失败: {str(e)}")
+
+
+@app.delete("/api/rad/projects/{project_name}")
+async def delete_rad_project(project_name: str):
+    if not rad_data_manager:
+        raise HTTPException(status_code=500, detail="热辐射数据管理器未初始化")
+
+    try:
+        result = rad_data_manager.delete_project(project_name)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除热辐射项目失败: {str(e)}")
+
+
+@app.get("/api/rad/projects/{project_name}/sessions/{session_id}/download")
+async def download_rad_session(project_name: str, session_id: str):
+    if not rad_data_manager:
+        raise HTTPException(status_code=500, detail="热辐射数据管理器未初始化")
+
+    try:
+        zip_path = rad_data_manager.build_session_zip(project_name, session_id)
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_{session_id}_rad.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载热辐射 session 失败: {str(e)}")
+
+
+@app.get("/api/rad/projects/{project_name}/download")
+async def download_rad_project(project_name: str):
+    if not rad_data_manager:
+        raise HTTPException(status_code=500, detail="热辐射数据管理器未初始化")
+
+    try:
+        zip_path = rad_data_manager.build_project_zip(project_name)
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_rad.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载热辐射项目失败: {str(e)}")
+
+# =============================================================================
+# Light 接口
+# =============================================================================
+@app.post("/api/light/start")
+async def start_light(payload: LightStartRequest):
+    if not light_handler:
+        raise HTTPException(status_code=500, detail="照明服务未初始化")
+
+    try:
+        if getattr(light_handler, "is_running", False):
+            return {
+                "success": True,
+                "message": "照明服务已经在运行",
+                "data": safe_get_status(light_handler, "light")
+            }
+
+        result = await light_handler.start({
+            "port": payload.port,
+            "baudrate": payload.baudrate,
+            "project_name": payload.project_name,
+            "save_options": payload.save_options
+        })
+
+        return {
+            "success": True,
+            "message": "照明服务启动成功",
+            "data": result if result is not None else safe_get_status(light_handler, "light")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"照明服务启动失败: {str(e)}")
+
+
+@app.post("/api/light/stop")
+async def stop_light():
+    if not light_handler:
+        raise HTTPException(status_code=500, detail="照明服务未初始化")
+
+    try:
+        if not getattr(light_handler, "is_running", False):
+            return {
+                "success": True,
+                "message": "照明服务当前未运行",
+                "data": safe_get_status(light_handler, "light")
+            }
+
+        result = await light_handler.stop()
+
+        return {
+            "success": True,
+            "message": "照明服务已停止",
+            "data": result if result is not None else safe_get_status(light_handler, "light")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"照明服务停止失败: {str(e)}")
+
+
+@app.get("/api/light/status")
+async def get_light_status():
+    if not light_handler:
+        raise HTTPException(status_code=500, detail="照明服务未初始化")
+
+    return {
+        "success": True,
+        "data": safe_get_status(light_handler, "light")
+    }
+
+
+@app.websocket("/api/light/ws")
+async def light_websocket(websocket: WebSocket):
+    if not light_handler:
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept()
+
+    try:
+        await light_handler.connect_websocket(websocket)
+
+        while True:
+            data = await websocket.receive_text()
+
+            if data == "ping":
+                await websocket.send_text("pong")
+            elif data == "status":
+                await websocket.send_json({
+                    "success": True,
+                    "data": safe_get_status(light_handler, "light")
+                })
+            else:
+                await websocket.send_json({
+                    "success": False,
+                    "message": f"未知指令: {data}"
+                })
+
+    except WebSocketDisconnect:
+        print("[LIGHT] WebSocket 客户端主动断开")
+    except Exception as e:
+        print(f"[LIGHT] WebSocket 异常断开: {e}")
+    finally:
+        try:
+            await light_handler.disconnect_websocket(websocket)
+        except Exception:
+            pass
+
+# =============================================================================
+# Light 数据管理接口
+# =============================================================================
+@app.get("/api/light/projects")
+async def get_light_projects():
+    if not light_data_manager:
+        raise HTTPException(status_code=500, detail="照明数据管理器未初始化")
+
+    try:
+        projects = light_data_manager.list_projects()
+        return {
+            "success": True,
+            "projects": projects
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取照明项目列表失败: {str(e)}")
+
+
+@app.get("/api/light/projects/{project_name}/sessions")
+async def get_light_project_sessions(project_name: str):
+    if not light_data_manager:
+        raise HTTPException(status_code=500, detail="照明数据管理器未初始化")
+
+    try:
+        sessions = light_data_manager.list_sessions(project_name)
+        return {
+            "success": True,
+            "project_name": project_name,
+            "sessions": sessions
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取照明 session 列表失败: {str(e)}")
+
+
+@app.get("/api/light/projects/{project_name}/sessions/{session_id}")
+async def get_light_session_info(project_name: str, session_id: str):
+    if not light_data_manager:
+        raise HTTPException(status_code=500, detail="照明数据管理器未初始化")
+
+    try:
+        session_info = light_data_manager.get_session_info(project_name, session_id)
+        return {
+            "success": True,
+            "project_name": project_name,
+            "session": session_info
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取照明 session 信息失败: {str(e)}")
+
+
+@app.delete("/api/light/projects/{project_name}/sessions/{session_id}")
+async def delete_light_session(project_name: str, session_id: str):
+    if not light_data_manager:
+        raise HTTPException(status_code=500, detail="照明数据管理器未初始化")
+
+    try:
+        result = light_data_manager.delete_session(project_name, session_id)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除照明 session 失败: {str(e)}")
+
+
+@app.delete("/api/light/projects/{project_name}")
+async def delete_light_project(project_name: str):
+    if not light_data_manager:
+        raise HTTPException(status_code=500, detail="照明数据管理器未初始化")
+
+    try:
+        result = light_data_manager.delete_project(project_name)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除照明项目失败: {str(e)}")
+
+
+@app.get("/api/light/projects/{project_name}/sessions/{session_id}/download")
+async def download_light_session(project_name: str, session_id: str):
+    if not light_data_manager:
+        raise HTTPException(status_code=500, detail="照明数据管理器未初始化")
+
+    try:
+        zip_path = light_data_manager.build_session_zip(project_name, session_id)
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_{session_id}_light.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载照明 session 失败: {str(e)}")
+
+
+@app.get("/api/light/projects/{project_name}/download")
+async def download_light_project(project_name: str):
+    if not light_data_manager:
+        raise HTTPException(status_code=500, detail="照明数据管理器未初始化")
+
+    try:
+        zip_path = light_data_manager.build_project_zip(project_name)
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_light.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载照明项目失败: {str(e)}")
+
+# =============================================================================
+# Thermal Environment 数据管理接口
+# =============================================================================
+@app.get("/api/thermal/projects/{project_name}/sessions/{session_id}/download")
+async def download_thermal_env_session(
+    project_name: str,
+    session_id: str,
+    temp_session_id: Optional[str] = None,
+    rad_session_id: Optional[str] = None,
+):
+    """
+    下载热环境合并 session。
+    通过 query string 可显式指定 temp_session_id / rad_session_id；
+    如果不传，则默认尝试使用同名 session_id。
+    """
+    if not temp_data_manager or not rad_data_manager:
+        raise HTTPException(status_code=500, detail="热环境数据管理器未初始化")
+
+    try:
+        zip_path = build_combined_session_zip(
+            project_name=project_name,
+            session_id=session_id,
+            temp_session_id=temp_session_id,
+            rad_session_id=rad_session_id,
+        )
+
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_{session_id}_thermal_env.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载热环境 session 失败: {str(e)}")
+
+# 新增“热环境项目级下载接口”
+@app.get("/api/thermal/projects/{project_name}/download")
+async def download_thermal_env_project(project_name: str):
+    """
+    下载整个热环境项目（包含该项目下所有温湿度 + 热辐射数据）
+    """
+    if not temp_data_manager or not rad_data_manager:
+        raise HTTPException(status_code=500, detail="热环境数据管理器未初始化")
+
+    try:
+        zip_path = build_combined_project_zip(project_name)
+
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"{project_name}_thermal_env.zip",
+            background=BackgroundTask(lambda: zip_path.unlink(missing_ok=True))
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载热环境项目失败: {str(e)}")
+
+# =============================================================================
+# Camera 接口
+# =============================================================================
+from typing import Optional
+
+import traceback
+
+@app.post("/api/camera/start")
+async def start_camera(payload: Optional[CameraStartRequest] = None):
+    if not cam_handler:
+        raise HTTPException(status_code=500, detail="视频服务未初始化")
+
+    try:
+        print("[DEBUG] camera start payload:", payload.dict() if payload else None)
+        if getattr(cam_handler, "is_running", False):
+            return {
+                "success": True,
+                "message": "视频服务已经在运行",
+                "data": safe_get_status(cam_handler, "camera")
+            }
+
+        if payload is None:
+            payload = CameraStartRequest()
+
+        result = await cam_handler.start({
+            "camera_index": payload.camera_index,
+            "frame_rate": payload.frame_rate,
+            "display_mode": payload.display_mode,
+            "project_name": payload.project_name,
+            "save_options": payload.save_options
+        })
+
+        return {
+            "success": True,
+            "message": "视频服务启动成功",
+            "data": result if result is not None else safe_get_status(cam_handler, "camera")
+        }
+
+    except Exception as e:
+        print("[MAIN] start_camera 异常：")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"视频服务启动失败: {str(e)}")
+
+
+@app.post("/api/camera/stop")
+async def stop_camera():
+    if not cam_handler:
+        raise HTTPException(status_code=500, detail="视频服务未初始化")
+
+    try:
+        if not getattr(cam_handler, "is_running", False):
+            return {
+                "success": True,
+                "message": "视频服务当前未运行",
+                "data": safe_get_status(cam_handler, "camera")
+            }
+
+        result = await cam_handler.stop()
+
+        return {
+            "success": True,
+            "message": "视频服务已停止",
+            "data": result if result is not None else safe_get_status(cam_handler, "camera")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"视频服务停止失败: {str(e)}")
+
+
+@app.get("/api/camera/status")
+async def get_camera_status():
+    if not cam_handler:
+        raise HTTPException(status_code=500, detail="视频服务未初始化")
+
+    return {
+        "success": True,
+        "data": safe_get_status(cam_handler, "camera")
+    }
+
+
+@app.websocket("/api/camera/ws")
+async def camera_websocket(websocket: WebSocket):
+    if not cam_handler:
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept()
+
+    try:
+        await cam_handler.connect_websocket(websocket)
+
+        while True:
+            data = await websocket.receive_text()
+
+            if data == "ping":
+                await websocket.send_text("pong")
+            elif data == "status":
+                await websocket.send_json({
+                    "success": True,
+                    "data": safe_get_status(cam_handler, "camera")
+                })
+            else:
+                await websocket.send_json({
+                    "success": False,
+                    "message": f"未知指令: {data}"
+                })
+
+    except WebSocketDisconnect:
+        print("[CAM] WebSocket 客户端主动断开")
+    except Exception as e:
+        print(f"[CAM] WebSocket 异常断开: {e}")
+    finally:
+        try:
+            await cam_handler.disconnect_websocket(websocket)
+        except Exception:
+            pass
+
+# =============================================================================
+# 启动入口
+# =============================================================================
+if __name__ == "__main__":
+    print("=" * 60)
+    print("多传感器数据采集服务")
+    print("=" * 60)
+    print("HTTP API   : http://0.0.0.0:8000")
+    print("Health     : http://0.0.0.0:8000/health")
+    print("Status API : http://0.0.0.0:8000/api/status")
+    print("CSI WS     : ws://0.0.0.0:8000/api/csi/ws")
+    print("Camera WS  : ws://0.0.0.0:8000/api/camera/ws")
+    print("Temp WS    : ws://0.0.0.0:8000/api/temp/ws")
+    print("Rad WS     : ws://0.0.0.0:8000/api/rad/ws")
+    print("Light WS   : ws://0.0.0.0:8000/api/light/ws")
+    print("=" * 60)
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
+        reload=False
+    )

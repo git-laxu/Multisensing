@@ -1,0 +1,14 @@
+DataCollectionPage.tsx 负责整个页面上的各部分的整体布局情况；
+
+sensorsettings.tsx负责面板上都有哪些内容
+对于传感器，不想显示来自模拟的话，就找“statusText={sensorStatus.temperatureHumidity === 'active' ? '正常' : '待机'}”这段，把下面的内容注释掉，把这句显示化；
+
+xxPanel是每个卡片面板内部的布局设置；
+
+Header是表头的设计与设置；
+
+ErrorBoundary是
+
+
+VisualizationPanel.tsx 负责温湿度热辐射和照明两个面板中数值和折线图的详细设置（问问gpt它真的参与panel设置了吗）
+VideoDisplay.tsx 负责视频和CSI两个面板中图像和数值板的详细设置（问问gpt它真的参与panel设置了吗）
